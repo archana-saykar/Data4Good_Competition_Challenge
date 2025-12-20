@@ -10,7 +10,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.pipeline import Pipeline, FeatureUnion
 from sklearn.preprocessing import FunctionTransformer
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from scipy.sparse import csr_matrix
 from sklearn.svm import LinearSVC
@@ -38,7 +37,7 @@ print("\nClass proportions (train):")
 print(train_df["type"].value_counts(normalize=True).round(3))
 
 # =========================
-# 2) Helpers
+# 2) Helpers (tokens, overlap, negation, numbers/years)
 # =========================
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 NUM_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
@@ -88,19 +87,7 @@ def extract_years(text):
     return set(YEAR_RE.findall(normalize_text(text)))
 
 # =========================
-# 3) Optional combined text (debug)
-# =========================
-def combine_text(row):
-    q = normalize_text(row.get("question", ""))
-    c = normalize_text(row.get("context", ""))
-    a = normalize_text(row.get("answer", ""))
-    return f"QUESTION: {q}\nCONTEXT: {c}\nANSWER: {a}"
-
-train_df["text"] = train_df.apply(combine_text, axis=1)
-test_df["text"] = test_df.apply(combine_text, axis=1)
-
-# =========================
-# 4) Linguistic feature builder
+# 3) Linguistic feature builder (overlap + negation + length + numbers/years)
 # =========================
 def build_linguistic_features(df: pd.DataFrame) -> csr_matrix:
     feats = []
@@ -156,13 +143,13 @@ def build_linguistic_features(df: pd.DataFrame) -> csr_matrix:
 
     X = np.array(feats, dtype=float)
 
-    # Scale length features
+    # Scale lengths
     X[:, 8]  /= 1000.0
     X[:, 9]  /= 1000.0
     X[:,10]  /= 1000.0
 
     # Scale count features slightly
-    for idx in [13,14,15,18,19,20]:
+    for idx in [13, 14, 15, 18, 19, 20]:
         X[:, idx] /= 10.0
 
     return csr_matrix(X)
@@ -170,7 +157,7 @@ def build_linguistic_features(df: pd.DataFrame) -> csr_matrix:
 linguistic_transformer = FunctionTransformer(build_linguistic_features, validate=False)
 
 # =========================
-# 5) Train/validation split
+# 4) Train/validation split (for reporting)
 # =========================
 X = train_df[["question", "context", "answer"]]
 y = train_df["type"]
@@ -183,7 +170,7 @@ X_train, X_val, y_train, y_val = train_test_split(
 )
 
 # =========================
-# 6) Feature pipeline (Split TF-IDF Q/C/A + Linguistic)
+# 5) Feature pipeline (Split TF-IDF Q/C/A + Answer char n-grams + Linguistic)
 # =========================
 def select_question(df): return df["question"].astype(str)
 def select_context(df):  return df["context"].astype(str)
@@ -195,24 +182,25 @@ a_selector = FunctionTransformer(select_answer, validate=False)
 
 tfidf_q = Pipeline([
     ("select_q", q_selector),
-    ("tfidf", TfidfVectorizer(ngram_range=(1,2), min_df=2, max_df=0.95))
+    ("tfidf", TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_df=0.95))
 ])
 
 tfidf_c = Pipeline([
     ("select_c", c_selector),
-    ("tfidf", TfidfVectorizer(ngram_range=(1,2), min_df=2, max_df=0.95))
+    ("tfidf", TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_df=0.95))
 ])
 
 tfidf_a = Pipeline([
     ("select_a", a_selector),
-    ("tfidf", TfidfVectorizer(ngram_range=(1,2), min_df=2, max_df=0.95))
+    ("tfidf", TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_df=0.95))
 ])
-# NEW: Character n-gram TF-IDF on ANSWER
+
+# Character n-grams on ANSWER (key improvement)
 tfidf_char_a = Pipeline([
     ("select_a", a_selector),
     ("tfidf", TfidfVectorizer(
         analyzer="char_wb",
-        ngram_range=(3,5),
+        ngram_range=(3, 5),
         min_df=3
     ))
 ])
@@ -221,116 +209,44 @@ ling_branch = Pipeline([
     ("ling", linguistic_transformer)
 ])
 
-features_split = FeatureUnion([
+features = FeatureUnion([
     ("tfidf_question", tfidf_q),
     ("tfidf_context", tfidf_c),
     ("tfidf_answer", tfidf_a),
-    ("tfidf_answer_char", tfidf_char_a),  # ⭐ NEW
+    ("tfidf_answer_char", tfidf_char_a),
     ("linguistic_features", ling_branch)
 ])
 
 # =========================
-# 7) Tune Logistic Regression C (A)
+# 6) Final Model: Linear SVM (best settings)
 # =========================
-C_values = [0.25, 0.5, 1, 2, 4, 8, 12]
-results = []
+final_model = Pipeline([
+    ("features", features),
+    ("clf", LinearSVC(class_weight="balanced", C=0.5))
+])
 
-best_model = None
-best_macro_f1 = -1.0
-best_C = None
-
-for C in C_values:
-    candidate = Pipeline([
-        ("features", features_split),
-        ("clf", LogisticRegression(
-            max_iter=7000,
-            class_weight="balanced",
-            C=C
-        ))
-    ])
-
-    candidate.fit(X_train, y_train)
-    preds = candidate.predict(X_val)
-
-    macro_f1 = f1_score(y_val, preds, average="macro")
-    weighted_f1 = f1_score(y_val, preds, average="weighted")
-    acc = (preds == y_val).mean()
-
-    results.append({
-        "C": C,
-        "Macro F1": round(macro_f1, 4),
-        "Weighted F1": round(weighted_f1, 4),
-        "Accuracy": round(acc, 4)
-    })
-
-    if macro_f1 > best_macro_f1:
-        best_macro_f1 = macro_f1
-        best_model = candidate
-        best_C = C
-
-results_df = pd.DataFrame(results).sort_values("Macro F1", ascending=False).reset_index(drop=True)
+# =========================
+# 7) Validate (optional but recommended for your report)
+# =========================
+final_model.fit(X_train, y_train)
+val_preds = final_model.predict(X_val)
 
 print("\n" + "="*90)
-print("C TUNING RESULTS (sorted by Macro F1)")
+print("FINAL MODEL: Split TF-IDF (Q/C/A) + Char n-grams + Linguistic + Linear SVM (C=0.5)")
 print("="*90)
-print(results_df)
-
-print(f"\n✅ Best C selected: {best_C} | Best Macro F1: {best_macro_f1:.4f}")
-
-# Evaluate best model in detail
-best_val_preds = best_model.predict(X_val)
-print("\n" + "="*90)
-print(f"BEST MODEL REPORT (C={best_C})")
-print("="*90)
-print(classification_report(y_val, best_val_preds, digits=3))
-
-
-C_values = [0.5, 1.0, 2.0, 4.0]
-svm_results = []
-
-best_svm = None
-best_svm_f1 = -1
-best_svm_C = None
-
-for C in C_values:
-    svm_model = Pipeline([
-        ("features", features_split),
-        ("clf", LinearSVC(class_weight="balanced", C=C))
-    ])
-    svm_model.fit(X_train, y_train)
-    preds = svm_model.predict(X_val)
-    macro_f1 = f1_score(y_val, preds, average="macro")
-
-    svm_results.append({"C": C, "Macro F1": round(macro_f1, 4)})
-
-    if macro_f1 > best_svm_f1:
-        best_svm_f1 = macro_f1
-        best_svm = svm_model
-        best_svm_C = C
-
-svm_results_df = pd.DataFrame(svm_results).sort_values("Macro F1", ascending=False)
-print("\n=== Linear SVM tuning results ===")
-print(svm_results_df)
-
-print(f"\n✅ Best SVM C = {best_svm_C} | Macro F1 = {best_svm_f1:.4f}")
-
-best_preds = best_svm.predict(X_val)
-print("\nBest SVM classification report:")
-print(classification_report(y_val, best_preds, digits=3))
-print("Confusion Matrix:\n", confusion_matrix(y_val, best_preds))
-print("Macro F1:", round(f1_score(y_val, best_preds, average="macro"), 4))
-
-print("Confusion Matrix:\n", confusion_matrix(y_val, best_val_preds))
-print("Macro F1:", round(f1_score(y_val, best_val_preds, average="macro"), 4))
+print(classification_report(y_val, val_preds, digits=3))
+print("Confusion Matrix:\n", confusion_matrix(y_val, val_preds))
+print("Macro F1:", round(f1_score(y_val, val_preds, average="macro"), 4))
 
 # =========================
-# 8) Train best model on full train + submission
+# 8) Train on full train + predict test + save submission
 # =========================
-best_model.fit(train_df[["question", "context", "answer"]], train_df["type"])
-test_preds = best_model.predict(test_df[["question", "context", "answer"]])
+final_model.fit(train_df[["question", "context", "answer"]], train_df["type"])
+test_preds = final_model.predict(test_df[["question", "context", "answer"]])
 
+# Use test ID column (your test has "ID")
 submission = pd.DataFrame({"ID": test_df["ID"], "type": test_preds})
-submission.to_csv("submission_bestC.csv", index=False)
+submission.to_csv("submission_final.csv", index=False)
 
-print("\nSaved submission_bestC.csv ✅")
+print("\nSaved submission_final.csv ✅")
 print(submission.head(10))
