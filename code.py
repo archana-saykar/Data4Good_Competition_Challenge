@@ -13,6 +13,7 @@ from sklearn.preprocessing import FunctionTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from scipy.sparse import csr_matrix
+from sklearn.svm import LinearSVC
 
 # =========================
 # 1) Load data
@@ -41,7 +42,7 @@ print(train_df["type"].value_counts(normalize=True).round(3))
 # =========================
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 NUM_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
-YEAR_RE = re.compile(r"\b(1[6-9]\d{2}|20\d{2}|21\d{2})\b")  # 1600-2199 (safe range)
+YEAR_RE = re.compile(r"\b(1[6-9]\d{2}|20\d{2}|21\d{2})\b")
 
 NEGATIONS = {
     "no", "not", "never", "none", "nobody", "nothing", "neither", "nowhere",
@@ -81,14 +82,13 @@ def negation_stats(text):
     return neg_count, has_neg
 
 def extract_numbers(text):
-    # return set of stringified numbers like {"12", "3.5"}
     return set(NUM_RE.findall(normalize_text(text)))
 
 def extract_years(text):
     return set(YEAR_RE.findall(normalize_text(text)))
 
 # =========================
-# 3) (Optional) combined text for reference/debug
+# 3) Optional combined text (debug)
 # =========================
 def combine_text(row):
     q = normalize_text(row.get("question", ""))
@@ -100,7 +100,7 @@ train_df["text"] = train_df.apply(combine_text, axis=1)
 test_df["text"] = test_df.apply(combine_text, axis=1)
 
 # =========================
-# 4) Build linguistic feature matrix (overlap + negation + lengths + numbers/years)
+# 4) Linguistic feature builder
 # =========================
 def build_linguistic_features(df: pd.DataFrame) -> csr_matrix:
     feats = []
@@ -113,7 +113,7 @@ def build_linguistic_features(df: pd.DataFrame) -> csr_matrix:
         c_t = set(tokens(c))
         a_t = set(tokens(a))
 
-        # Overlap features (text)
+        # Overlap features
         jac_ac = jaccard(a_t, c_t)
         jac_aq = jaccard(a_t, q_t)
         ov_ac = overlap_ratio(a_t, c_t)
@@ -131,17 +131,15 @@ def build_linguistic_features(df: pd.DataFrame) -> csr_matrix:
         # Number features
         a_nums = extract_numbers(a)
         c_nums = extract_numbers(c)
-
-        num_jac = jaccard(a_nums, c_nums)               # similarity of numbers
-        num_ov = overlap_ratio(a_nums, c_nums)          # % of answer numbers seen in context
+        num_jac = jaccard(a_nums, c_nums)
+        num_ov = overlap_ratio(a_nums, c_nums)
         num_a_count = len(a_nums)
         num_c_count = len(c_nums)
-        num_extra_in_answer = max(0, num_a_count - len(a_nums & c_nums))  # answer numbers not in context
+        num_extra_in_answer = max(0, num_a_count - len(a_nums & c_nums))
 
         # Year features
         a_years = extract_years(a)
         c_years = extract_years(c)
-
         year_jac = jaccard(a_years, c_years)
         year_ov = overlap_ratio(a_years, c_years)
         year_a_count = len(a_years)
@@ -149,29 +147,23 @@ def build_linguistic_features(df: pd.DataFrame) -> csr_matrix:
         year_extra_in_answer = max(0, year_a_count - len(a_years & c_years))
 
         feats.append([
-            # original
             jac_ac, jac_aq, ov_ac, ov_aq,
             neg_a_count, neg_a_has, neg_c_count, neg_c_has,
             a_len, c_len, q_len,
-
-            # numbers
             num_jac, num_ov, num_a_count, num_c_count, num_extra_in_answer,
-
-            # years
             year_jac, year_ov, year_a_count, year_c_count, year_extra_in_answer
         ])
 
     X = np.array(feats, dtype=float)
 
-    # Scale lengths so they don't dominate
-    X[:, 8]  = X[:, 8]  / 1000.0  # a_len
-    X[:, 9]  = X[:, 9]  / 1000.0  # c_len
-    X[:,10]  = X[:,10]  / 1000.0  # q_len
+    # Scale length features
+    X[:, 8]  /= 1000.0
+    X[:, 9]  /= 1000.0
+    X[:,10]  /= 1000.0
 
-    # Optional mild scaling for counts to keep them comparable
-    # (counts are usually small, but this prevents edge cases)
-    for idx in [13,14,15,18,19,20]:  # num_a_count, num_c_count, num_extra, year_a_count, year_c_count, year_extra
-        X[:, idx] = X[:, idx] / 10.0
+    # Scale count features slightly
+    for idx in [13,14,15,18,19,20]:
+        X[:, idx] /= 10.0
 
     return csr_matrix(X)
 
@@ -191,7 +183,7 @@ X_train, X_val, y_train, y_val = train_test_split(
 )
 
 # =========================
-# 6) Model: Split TF-IDF (Q/C/A) + Linguistic features + numbers/years
+# 6) Feature pipeline (Split TF-IDF Q/C/A + Linguistic)
 # =========================
 def select_question(df): return df["question"].astype(str)
 def select_context(df):  return df["context"].astype(str)
@@ -215,6 +207,15 @@ tfidf_a = Pipeline([
     ("select_a", a_selector),
     ("tfidf", TfidfVectorizer(ngram_range=(1,2), min_df=2, max_df=0.95))
 ])
+# NEW: Character n-gram TF-IDF on ANSWER
+tfidf_char_a = Pipeline([
+    ("select_a", a_selector),
+    ("tfidf", TfidfVectorizer(
+        analyzer="char_wb",
+        ngram_range=(3,5),
+        min_df=3
+    ))
+])
 
 ling_branch = Pipeline([
     ("ling", linguistic_transformer)
@@ -224,36 +225,75 @@ features_split = FeatureUnion([
     ("tfidf_question", tfidf_q),
     ("tfidf_context", tfidf_c),
     ("tfidf_answer", tfidf_a),
+    ("tfidf_answer_char", tfidf_char_a),  # ⭐ NEW
     ("linguistic_features", ling_branch)
 ])
 
-model = Pipeline([
-    ("features", features_split),
-    ("clf", LogisticRegression(max_iter=5000, class_weight="balanced"))
-])
+# =========================
+# 7) Tune Logistic Regression C (A)
+# =========================
+C_values = [0.25, 0.5, 1, 2, 4, 8, 12]
+results = []
 
-# Train + evaluate
-model.fit(X_train, y_train)
-val_preds = model.predict(X_val)
+best_model = None
+best_macro_f1 = -1.0
+best_C = None
+
+for C in C_values:
+    candidate = Pipeline([
+        ("features", features_split),
+        ("clf", LogisticRegression(
+            max_iter=7000,
+            class_weight="balanced",
+            C=C
+        ))
+    ])
+
+    candidate.fit(X_train, y_train)
+    preds = candidate.predict(X_val)
+
+    macro_f1 = f1_score(y_val, preds, average="macro")
+    weighted_f1 = f1_score(y_val, preds, average="weighted")
+    acc = (preds == y_val).mean()
+
+    results.append({
+        "C": C,
+        "Macro F1": round(macro_f1, 4),
+        "Weighted F1": round(weighted_f1, 4),
+        "Accuracy": round(acc, 4)
+    })
+
+    if macro_f1 > best_macro_f1:
+        best_macro_f1 = macro_f1
+        best_model = candidate
+        best_C = C
+
+results_df = pd.DataFrame(results).sort_values("Macro F1", ascending=False).reset_index(drop=True)
 
 print("\n" + "="*90)
-print("MODEL: Split TF-IDF (Q/C/A) + Overlap/Negation + Numbers/Years + LR (balanced)")
+print("C TUNING RESULTS (sorted by Macro F1)")
 print("="*90)
-print(classification_report(y_val, val_preds, digits=3))
-print("Confusion Matrix:\n", confusion_matrix(y_val, val_preds))
-print("Macro F1:", round(f1_score(y_val, val_preds, average="macro"), 4))
+print(results_df)
+
+print(f"\n✅ Best C selected: {best_C} | Best Macro F1: {best_macro_f1:.4f}")
+
+# Evaluate best model in detail
+best_val_preds = best_model.predict(X_val)
+print("\n" + "="*90)
+print(f"BEST MODEL REPORT (C={best_C})")
+print("="*90)
+print(classification_report(y_val, best_val_preds, digits=3))
+print("Confusion Matrix:\n", confusion_matrix(y_val, best_val_preds))
+print("Macro F1:", round(f1_score(y_val, best_val_preds, average="macro"), 4))
 
 # =========================
-# 7) Train full + submission
+# 8) Train best model on full train + submission
 # =========================
-model.fit(train_df[["question", "context", "answer"]], train_df["type"])
-test_preds = model.predict(test_df[["question", "context", "answer"]])
+best_model.fit(train_df[["question", "context", "answer"]], train_df["type"])
+test_preds = best_model.predict(test_df[["question", "context", "answer"]])
 
-if "ID" in test_df.columns:
-    submission = pd.DataFrame({"ID": test_df["ID"], "type": test_preds})
-else:
-    submission = pd.DataFrame({"index": range(len(test_df)), "type": test_preds})
+submission = pd.DataFrame({"ID": test_df["ID"], "type": test_preds})
+submission.to_csv("submission_bestC.csv", index=False)
 
-submission.to_csv("submission_split_tfidf_linguistic_numbers.csv", index=False)
-print("\nSaved submission_split_tfidf_linguistic_numbers.csv ✅")
+print("\nSaved submission_bestC.csv ✅")
 print(submission.head(10))
