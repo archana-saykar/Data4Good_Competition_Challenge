@@ -1,4 +1,3 @@
-
 # =========================
 # 0) Imports
 # =========================
@@ -68,7 +67,6 @@ def jaccard(set_a, set_b):
     return inter / union if union else 0.0
 
 def overlap_ratio(ans_set, other_set):
-    # How much of answer is supported by other text (context/question)
     if not ans_set:
         return 0.0
     inter = len(ans_set & other_set)
@@ -81,7 +79,7 @@ def negation_stats(text):
     return neg_count, has_neg
 
 # =========================
-# 3) Create combined text for TF-IDF
+# 3) (Optional) combined text - not used for TF-IDF now, but kept for reference/debug
 # =========================
 def combine_text(row):
     q = normalize_text(row.get("question", ""))
@@ -107,16 +105,16 @@ def build_linguistic_features(df: pd.DataFrame) -> csr_matrix:
         a_t = set(tokens(a))
 
         # Overlap features
-        jac_ac = jaccard(a_t, c_t)            # similarity between answer & context
-        jac_aq = jaccard(a_t, q_t)            # similarity between answer & question
-        ov_ac = overlap_ratio(a_t, c_t)       # % of answer tokens found in context
-        ov_aq = overlap_ratio(a_t, q_t)       # % of answer tokens found in question
+        jac_ac = jaccard(a_t, c_t)
+        jac_aq = jaccard(a_t, q_t)
+        ov_ac = overlap_ratio(a_t, c_t)
+        ov_aq = overlap_ratio(a_t, q_t)
 
-        # Negation features (mainly useful for contradiction)
+        # Negation features
         neg_a_count, neg_a_has = negation_stats(a)
         neg_c_count, neg_c_has = negation_stats(c)
 
-        # Length features (sometimes irrelevant answers are very short/very long)
+        # Length features
         a_len = len(normalize_text(a))
         c_len = len(normalize_text(c))
         q_len = len(normalize_text(q))
@@ -129,21 +127,19 @@ def build_linguistic_features(df: pd.DataFrame) -> csr_matrix:
 
     X = np.array(feats, dtype=float)
 
-    # Light scaling to keep magnitudes reasonable (optional but helpful)
-    # We’ll scale lengths down to avoid dominating.
-    X[:, 8] = X[:, 8] / 1000.0  # a_len
-    X[:, 9] = X[:, 9] / 1000.0  # c_len
-    X[:,10] = X[:,10] / 1000.0  # q_len
+    # Scale lengths so they don't dominate
+    X[:, 8] = X[:, 8] / 1000.0
+    X[:, 9] = X[:, 9] / 1000.0
+    X[:,10] = X[:,10] / 1000.0
 
     return csr_matrix(X)
 
-# Transformers that sklearn Pipeline can use
 linguistic_transformer = FunctionTransformer(build_linguistic_features, validate=False)
 
 # =========================
 # 5) Train/validation split
 # =========================
-X = train_df[["question", "context", "answer", "text"]]  # pass df to feature builders
+X = train_df[["question", "context", "answer"]]   # key change: no need to pass "text" for TF-IDF
 y = train_df["type"]
 
 X_train, X_val, y_train, y_val = train_test_split(
@@ -154,47 +150,59 @@ X_train, X_val, y_train, y_val = train_test_split(
 )
 
 # =========================
-# 6) Model: TF-IDF + linguistic features (FeatureUnion)
+# 6) Model: Split TF-IDF (Q/C/A) + Linguistic features
 # =========================
 
-# TF-IDF should run on the "text" column only
-def select_text_column(df):
-    return df["text"].astype(str)
+# Column selectors
+def select_question(df): return df["question"].astype(str)
+def select_context(df):  return df["context"].astype(str)
+def select_answer(df):   return df["answer"].astype(str)
 
-text_selector = FunctionTransformer(select_text_column, validate=False)
+q_selector = FunctionTransformer(select_question, validate=False)
+c_selector = FunctionTransformer(select_context, validate=False)
+a_selector = FunctionTransformer(select_answer, validate=False)
 
-tfidf_branch = Pipeline([
-    ("select_text", text_selector),
-    ("tfidf", TfidfVectorizer(
-        ngram_range=(1, 2),
-        min_df=2,
-        max_df=0.95
-    ))
+# Separate TF-IDF branches
+tfidf_q = Pipeline([
+    ("select_q", q_selector),
+    ("tfidf", TfidfVectorizer(ngram_range=(1,2), min_df=2, max_df=0.95))
 ])
 
-# Linguistic features branch
+tfidf_c = Pipeline([
+    ("select_c", c_selector),
+    ("tfidf", TfidfVectorizer(ngram_range=(1,2), min_df=2, max_df=0.95))
+])
+
+tfidf_a = Pipeline([
+    ("select_a", a_selector),
+    ("tfidf", TfidfVectorizer(ngram_range=(1,2), min_df=2, max_df=0.95))
+])
+
+# Linguistic features branch (uses df with q/c/a)
 ling_branch = Pipeline([
     ("ling", linguistic_transformer)
 ])
 
-# Combine both feature spaces
-features = FeatureUnion([
-    ("tfidf_features", tfidf_branch),
+# Combine all features
+features_split = FeatureUnion([
+    ("tfidf_question", tfidf_q),
+    ("tfidf_context", tfidf_c),
+    ("tfidf_answer", tfidf_a),
     ("linguistic_features", ling_branch)
 ])
 
 model = Pipeline([
-    ("features", features),
-    ("clf", LogisticRegression(max_iter=3000, class_weight="balanced"))
+    ("features", features_split),
+    ("clf", LogisticRegression(max_iter=4000, class_weight="balanced"))
 ])
 
 # Train + evaluate
 model.fit(X_train, y_train)
 val_preds = model.predict(X_val)
 
-print("\n" + "="*70)
-print("MODEL: TF-IDF + Overlap/Negation + Logistic Regression (balanced)")
-print("="*70)
+print("\n" + "="*80)
+print("MODEL: Split TF-IDF (Q/C/A) + Overlap/Negation + Logistic Regression (balanced)")
+print("="*80)
 print(classification_report(y_val, val_preds, digits=3))
 print("Confusion Matrix:\n", confusion_matrix(y_val, val_preds))
 print("Macro F1:", round(f1_score(y_val, val_preds, average="macro"), 4))
@@ -202,16 +210,16 @@ print("Macro F1:", round(f1_score(y_val, val_preds, average="macro"), 4))
 # =========================
 # 7) Train on full train and create submission
 # =========================
-model.fit(train_df[["question", "context", "answer", "text"]], train_df["type"])
-test_preds = model.predict(test_df[["question", "context", "answer", "text"]])
+model.fit(train_df[["question", "context", "answer"]], train_df["type"])
+test_preds = model.predict(test_df[["question", "context", "answer"]])
 
-# Use ID column from your test set
+# Use ID column from test set
 if "ID" in test_df.columns:
     submission = pd.DataFrame({"ID": test_df["ID"], "type": test_preds})
 else:
-    # fallback if ID isn't present
     submission = pd.DataFrame({"index": range(len(test_df)), "type": test_preds})
 
-submission.to_csv("submission_linguistic.csv", index=False)
-print("\nSaved submission_linguistic.csv ✅")
+submission.to_csv("submission_split_tfidf_linguistic.csv", index=False)
+print("\nSaved submission_split_tfidf_linguistic.csv ✅")
 print(submission.head(10))
+
