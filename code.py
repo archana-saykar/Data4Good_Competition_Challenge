@@ -40,6 +40,8 @@ print(train_df["type"].value_counts(normalize=True).round(3))
 # 2) Helpers
 # =========================
 TOKEN_RE = re.compile(r"[a-z0-9]+")
+NUM_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
+YEAR_RE = re.compile(r"\b(1[6-9]\d{2}|20\d{2}|21\d{2})\b")  # 1600-2199 (safe range)
 
 NEGATIONS = {
     "no", "not", "never", "none", "nobody", "nothing", "neither", "nowhere",
@@ -78,8 +80,15 @@ def negation_stats(text):
     has_neg = 1 if neg_count > 0 else 0
     return neg_count, has_neg
 
+def extract_numbers(text):
+    # return set of stringified numbers like {"12", "3.5"}
+    return set(NUM_RE.findall(normalize_text(text)))
+
+def extract_years(text):
+    return set(YEAR_RE.findall(normalize_text(text)))
+
 # =========================
-# 3) (Optional) combined text - not used for TF-IDF now, but kept for reference/debug
+# 3) (Optional) combined text for reference/debug
 # =========================
 def combine_text(row):
     q = normalize_text(row.get("question", ""))
@@ -91,7 +100,7 @@ train_df["text"] = train_df.apply(combine_text, axis=1)
 test_df["text"] = test_df.apply(combine_text, axis=1)
 
 # =========================
-# 4) Build linguistic feature matrix (overlap + negation + lengths)
+# 4) Build linguistic feature matrix (overlap + negation + lengths + numbers/years)
 # =========================
 def build_linguistic_features(df: pd.DataFrame) -> csr_matrix:
     feats = []
@@ -104,7 +113,7 @@ def build_linguistic_features(df: pd.DataFrame) -> csr_matrix:
         c_t = set(tokens(c))
         a_t = set(tokens(a))
 
-        # Overlap features
+        # Overlap features (text)
         jac_ac = jaccard(a_t, c_t)
         jac_aq = jaccard(a_t, q_t)
         ov_ac = overlap_ratio(a_t, c_t)
@@ -119,18 +128,50 @@ def build_linguistic_features(df: pd.DataFrame) -> csr_matrix:
         c_len = len(normalize_text(c))
         q_len = len(normalize_text(q))
 
+        # Number features
+        a_nums = extract_numbers(a)
+        c_nums = extract_numbers(c)
+
+        num_jac = jaccard(a_nums, c_nums)               # similarity of numbers
+        num_ov = overlap_ratio(a_nums, c_nums)          # % of answer numbers seen in context
+        num_a_count = len(a_nums)
+        num_c_count = len(c_nums)
+        num_extra_in_answer = max(0, num_a_count - len(a_nums & c_nums))  # answer numbers not in context
+
+        # Year features
+        a_years = extract_years(a)
+        c_years = extract_years(c)
+
+        year_jac = jaccard(a_years, c_years)
+        year_ov = overlap_ratio(a_years, c_years)
+        year_a_count = len(a_years)
+        year_c_count = len(c_years)
+        year_extra_in_answer = max(0, year_a_count - len(a_years & c_years))
+
         feats.append([
+            # original
             jac_ac, jac_aq, ov_ac, ov_aq,
             neg_a_count, neg_a_has, neg_c_count, neg_c_has,
-            a_len, c_len, q_len
+            a_len, c_len, q_len,
+
+            # numbers
+            num_jac, num_ov, num_a_count, num_c_count, num_extra_in_answer,
+
+            # years
+            year_jac, year_ov, year_a_count, year_c_count, year_extra_in_answer
         ])
 
     X = np.array(feats, dtype=float)
 
     # Scale lengths so they don't dominate
-    X[:, 8] = X[:, 8] / 1000.0
-    X[:, 9] = X[:, 9] / 1000.0
-    X[:,10] = X[:,10] / 1000.0
+    X[:, 8]  = X[:, 8]  / 1000.0  # a_len
+    X[:, 9]  = X[:, 9]  / 1000.0  # c_len
+    X[:,10]  = X[:,10]  / 1000.0  # q_len
+
+    # Optional mild scaling for counts to keep them comparable
+    # (counts are usually small, but this prevents edge cases)
+    for idx in [13,14,15,18,19,20]:  # num_a_count, num_c_count, num_extra, year_a_count, year_c_count, year_extra
+        X[:, idx] = X[:, idx] / 10.0
 
     return csr_matrix(X)
 
@@ -139,7 +180,7 @@ linguistic_transformer = FunctionTransformer(build_linguistic_features, validate
 # =========================
 # 5) Train/validation split
 # =========================
-X = train_df[["question", "context", "answer"]]   # key change: no need to pass "text" for TF-IDF
+X = train_df[["question", "context", "answer"]]
 y = train_df["type"]
 
 X_train, X_val, y_train, y_val = train_test_split(
@@ -150,10 +191,8 @@ X_train, X_val, y_train, y_val = train_test_split(
 )
 
 # =========================
-# 6) Model: Split TF-IDF (Q/C/A) + Linguistic features
+# 6) Model: Split TF-IDF (Q/C/A) + Linguistic features + numbers/years
 # =========================
-
-# Column selectors
 def select_question(df): return df["question"].astype(str)
 def select_context(df):  return df["context"].astype(str)
 def select_answer(df):   return df["answer"].astype(str)
@@ -162,7 +201,6 @@ q_selector = FunctionTransformer(select_question, validate=False)
 c_selector = FunctionTransformer(select_context, validate=False)
 a_selector = FunctionTransformer(select_answer, validate=False)
 
-# Separate TF-IDF branches
 tfidf_q = Pipeline([
     ("select_q", q_selector),
     ("tfidf", TfidfVectorizer(ngram_range=(1,2), min_df=2, max_df=0.95))
@@ -178,12 +216,10 @@ tfidf_a = Pipeline([
     ("tfidf", TfidfVectorizer(ngram_range=(1,2), min_df=2, max_df=0.95))
 ])
 
-# Linguistic features branch (uses df with q/c/a)
 ling_branch = Pipeline([
     ("ling", linguistic_transformer)
 ])
 
-# Combine all features
 features_split = FeatureUnion([
     ("tfidf_question", tfidf_q),
     ("tfidf_context", tfidf_c),
@@ -193,33 +229,31 @@ features_split = FeatureUnion([
 
 model = Pipeline([
     ("features", features_split),
-    ("clf", LogisticRegression(max_iter=4000, class_weight="balanced"))
+    ("clf", LogisticRegression(max_iter=5000, class_weight="balanced"))
 ])
 
 # Train + evaluate
 model.fit(X_train, y_train)
 val_preds = model.predict(X_val)
 
-print("\n" + "="*80)
-print("MODEL: Split TF-IDF (Q/C/A) + Overlap/Negation + Logistic Regression (balanced)")
-print("="*80)
+print("\n" + "="*90)
+print("MODEL: Split TF-IDF (Q/C/A) + Overlap/Negation + Numbers/Years + LR (balanced)")
+print("="*90)
 print(classification_report(y_val, val_preds, digits=3))
 print("Confusion Matrix:\n", confusion_matrix(y_val, val_preds))
 print("Macro F1:", round(f1_score(y_val, val_preds, average="macro"), 4))
 
 # =========================
-# 7) Train on full train and create submission
+# 7) Train full + submission
 # =========================
 model.fit(train_df[["question", "context", "answer"]], train_df["type"])
 test_preds = model.predict(test_df[["question", "context", "answer"]])
 
-# Use ID column from test set
 if "ID" in test_df.columns:
     submission = pd.DataFrame({"ID": test_df["ID"], "type": test_preds})
 else:
     submission = pd.DataFrame({"index": range(len(test_df)), "type": test_preds})
 
-submission.to_csv("submission_split_tfidf_linguistic.csv", index=False)
-print("\nSaved submission_split_tfidf_linguistic.csv ✅")
+submission.to_csv("submission_split_tfidf_linguistic_numbers.csv", index=False)
+print("\nSaved submission_split_tfidf_linguistic_numbers.csv ✅")
 print(submission.head(10))
-
