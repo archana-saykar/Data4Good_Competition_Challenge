@@ -283,6 +283,43 @@ print("\n" + "="*90)
 print(f"BEST MODEL REPORT (C={best_C})")
 print("="*90)
 print(classification_report(y_val, best_val_preds, digits=3))
+
+
+C_values = [0.5, 1.0, 2.0, 4.0]
+svm_results = []
+
+best_svm = None
+best_svm_f1 = -1
+best_svm_C = None
+
+for C in C_values:
+    svm_model = Pipeline([
+        ("features", features_split),
+        ("clf", LinearSVC(class_weight="balanced", C=C))
+    ])
+    svm_model.fit(X_train, y_train)
+    preds = svm_model.predict(X_val)
+    macro_f1 = f1_score(y_val, preds, average="macro")
+
+    svm_results.append({"C": C, "Macro F1": round(macro_f1, 4)})
+
+    if macro_f1 > best_svm_f1:
+        best_svm_f1 = macro_f1
+        best_svm = svm_model
+        best_svm_C = C
+
+svm_results_df = pd.DataFrame(svm_results).sort_values("Macro F1", ascending=False)
+print("\n=== Linear SVM tuning results ===")
+print(svm_results_df)
+
+print(f"\n✅ Best SVM C = {best_svm_C} | Macro F1 = {best_svm_f1:.4f}")
+
+best_preds = best_svm.predict(X_val)
+print("\nBest SVM classification report:")
+print(classification_report(y_val, best_preds, digits=3))
+print("Confusion Matrix:\n", confusion_matrix(y_val, best_preds))
+print("Macro F1:", round(f1_score(y_val, best_preds, average="macro"), 4))
+
 print("Confusion Matrix:\n", confusion_matrix(y_val, best_val_preds))
 print("Macro F1:", round(f1_score(y_val, best_val_preds, average="macro"), 4))
 
