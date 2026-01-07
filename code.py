@@ -1,10 +1,17 @@
 # =========================
+# FINAL SUBMISSION CODE (JSON output)
+# - Trains on train.json
+# - Predicts labels for test.json
+# - Saves predictions to submission_final.json (required by submission form)
+# =========================
+
+# =========================
 # 0) Imports
 # =========================
-import pandas as pd
 import json
 import re
 import numpy as np
+import pandas as pd
 
 from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -26,15 +33,10 @@ with open("data/test.json", "r", encoding="utf-8") as f:
 train_df = pd.DataFrame(train_data)
 test_df = pd.DataFrame(test_data)
 
-print("Train shape:", train_df.shape)
-print("Test shape:", test_df.shape)
-print("Train columns:", list(train_df.columns))
-print("Test columns:", list(test_df.columns))
-
-print("\nClass distribution (train):")
-print(train_df["type"].value_counts())
-print("\nClass proportions (train):")
-print(train_df["type"].value_counts(normalize=True).round(3))
+# Basic checks (keep minimal)
+assert {"question", "context", "answer", "type"}.issubset(set(train_df.columns)), "Train columns missing!"
+assert {"ID", "question", "context", "answer"}.issubset(set(test_df.columns)), "Test columns missing!"
+print("Loaded ✅ | Train:", train_df.shape, "| Test:", test_df.shape)
 
 # =========================
 # 2) Helpers (tokens, overlap, negation, numbers/years)
@@ -87,7 +89,7 @@ def extract_years(text):
     return set(YEAR_RE.findall(normalize_text(text)))
 
 # =========================
-# 3) Linguistic feature builder (overlap + negation + length + numbers/years)
+# 3) Linguistic feature builder
 # =========================
 def build_linguistic_features(df: pd.DataFrame) -> csr_matrix:
     feats = []
@@ -157,20 +159,7 @@ def build_linguistic_features(df: pd.DataFrame) -> csr_matrix:
 linguistic_transformer = FunctionTransformer(build_linguistic_features, validate=False)
 
 # =========================
-# 4) Train/validation split (for reporting)
-# =========================
-X = train_df[["question", "context", "answer"]]
-y = train_df["type"]
-
-X_train, X_val, y_train, y_val = train_test_split(
-    X, y,
-    test_size=0.2,
-    random_state=42,
-    stratify=y
-)
-
-# =========================
-# 5) Feature pipeline (Split TF-IDF Q/C/A + Answer char n-grams + Linguistic)
+# 4) Feature pipeline: Split TF-IDF Q/C/A + Answer char n-grams + Linguistic
 # =========================
 def select_question(df): return df["question"].astype(str)
 def select_context(df):  return df["context"].astype(str)
@@ -195,7 +184,6 @@ tfidf_a = Pipeline([
     ("tfidf", TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_df=0.95))
 ])
 
-# Character n-grams on ANSWER (key improvement)
 tfidf_char_a = Pipeline([
     ("select_a", a_selector),
     ("tfidf", TfidfVectorizer(
@@ -218,7 +206,7 @@ features = FeatureUnion([
 ])
 
 # =========================
-# 6) Final Model: Linear SVM (best settings)
+# 5) Final Model: Linear SVM (best settings)
 # =========================
 final_model = Pipeline([
     ("features", features),
@@ -226,8 +214,16 @@ final_model = Pipeline([
 ])
 
 # =========================
-# 7) Validate (optional but recommended for your report)
+# 6) (Optional) Validation metrics for your report
 # =========================
+# Keep this ON while writing your report; you can comment it out for a super-clean final run.
+X_all = train_df[["question", "context", "answer"]]
+y_all = train_df["type"]
+
+X_train, X_val, y_train, y_val = train_test_split(
+    X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
+)
+
 final_model.fit(X_train, y_train)
 val_preds = final_model.predict(X_val)
 
@@ -239,14 +235,26 @@ print("Confusion Matrix:\n", confusion_matrix(y_val, val_preds))
 print("Macro F1:", round(f1_score(y_val, val_preds, average="macro"), 4))
 
 # =========================
-# 8) Train on full train + predict test + save submission
+# 7) Train on full train + predict test
 # =========================
-final_model.fit(train_df[["question", "context", "answer"]], train_df["type"])
+final_model.fit(X_all, y_all)
 test_preds = final_model.predict(test_df[["question", "context", "answer"]])
 
-# Use test ID column (your test has "ID")
-submission = pd.DataFrame({"ID": test_df["ID"], "type": test_preds})
-submission.to_csv("submission_final.csv", index=False)
+# =========================
+# 8) Save submission as JSON (REQUIRED by submission instructions)
+# Structure: list of {"ID": <int>, "type": <label>}
+# =========================
+submission = [
+    {"ID": int(i), "type": str(t)}
+    for i, t in zip(test_df["ID"].tolist(), test_preds.tolist())
+]
 
-print("\nSaved submission_final.csv ✅")
-print(submission.head(10))
+# Sanity checks
+assert len(submission) == len(test_df) == 2000, "Submission length mismatch!"
+assert all(("ID" in r and "type" in r) for r in submission), "Missing keys in submission!"
+
+with open("submission_final.json", "w", encoding="utf-8") as f:
+    json.dump(submission, f, indent=2)
+
+print("\nSaved submission_final.json ✅")
+print("Preview:", submission[:5])
